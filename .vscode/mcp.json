@@ -1,0 +1,17 @@
+{
+	"servers": {
+		"microsoft-learn": {
+			"url": "https://learn.microsoft.com/api/mcp",
+			"type": "http"
+		},
+		//draw.io MCP Server using npx
+		"drawio": {
+			"command": "npx",
+			"args": [
+				"-y",
+				"@drawio/mcp"
+			]
+		}
+	},
+	"inputs": []
+}
