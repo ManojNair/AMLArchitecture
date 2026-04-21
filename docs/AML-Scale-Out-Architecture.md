@@ -233,6 +233,43 @@ Both modules are pure IaC (Bicep or Terraform using [AVM modules](https://azure.
 
 Product-group membership is derived from `product_id` and pinned on first onboarding; **workspaces never move between subscriptions** (see Risks).
 
+### 6.3.1 Worked example — onboarding Product 101
+
+Product 101 is the **first product beyond the original 100**, which means a new product-group subscription must be vended.
+
+```
+Data scientist submits intake form
+  → product_id=101, env=prd, region=weu, sku=Standard_DS3_v2
+
+Allocator runs:
+  → pg_index = ceil(101 / 25) = 5  →  target is sub-aml-prd-pg05
+  → sub-aml-prd-pg05 does not exist yet
+  → triggers the existing stamping pipeline to vend sub-aml-prd-pg05
+```
+
+**Pipeline execution (new subscription + first product):**
+
+| Step | Module | Action | Approx. time |
+|---|---|---|---|
+| 1 | Existing pipeline | `Microsoft.Subscription` API creates `sub-aml-prd-pg05` | ~5 min |
+| 2 | Existing pipeline | MG placement under Corp LZ + policy assignment | ~2 min |
+| 3 | Existing pipeline | Spoke VNet creation + hub VNet peering | ~5 min |
+| 4 | **`aml-sub-shared`** | Deploy shared ACR (Premium, PE-enabled) + private DNS zone links to ALZ central zones + diagnostic settings → ALZ Log Analytics | ~8 min |
+| 5 | **`aml-product-stamp`** | Deploy `rg-aml-prd-p101` containing: AML workspace, ADLS Gen2, Key Vault, App Insights, 14-node AmlCompute cluster (`min=0, max=14`), batch endpoint, private endpoints | ~15 min |
+
+**Data scientist receives:**
+
+| What | Value |
+|---|---|
+| Workspace | `mlw-prd-p101-weu` |
+| Batch endpoint | `bep-p101-scoring` |
+| Resource group | `rg-aml-prd-p101` |
+| RBAC | Contributor on `rg-aml-prd-p101` |
+
+**Subsequent products (102–125) skip steps 1–4.** The subscription already exists and `aml-sub-shared` has already run, so only step 5 (`aml-product-stamp`) executes — roughly 15 minutes per product.
+
+> **Note:** The flow runs **3× per product** — once for each environment (dev, tst, prd). The allocator uses the same formula, so `sub-aml-dev-pg05`, `sub-aml-tst-pg05`, and `sub-aml-prd-pg05` are all vended (if they don't already exist) when product 101 is onboarded.
+
 ### 6.4 Quota operating model
 
 - **Quota Groups** to pool VM core quotas across the 4 (or more) product-group subs of the same environment. ([Quota Groups](https://learn.microsoft.com/azure/quotas/quota-groups))
