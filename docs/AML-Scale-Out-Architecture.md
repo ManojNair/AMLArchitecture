@@ -108,11 +108,12 @@ flowchart LR
             DNSLINK["Private DNS zone links<br/>(to ALZ central zones)"]
             LAW["Log Analytics link<br/>(to ALZ central LA)"]
         end
-        subgraph STAMP["rg-aml-p{nnn}-{env} — one AML stamp per product"]
+        subgraph STAMP["rg-aml-{env}-p{nnn} — one AML stamp per product"]
             WS["AML Workspace"]
             ST["ADLS Gen2 (workspace default store)"]
             KV["Key Vault"]
             AI["Application Insights"]
+            MI["User-assigned managed identity"]
             CC["AmlCompute cluster<br/>min=0, max=14 (batch)"]
             BEP["Batch Endpoint<br/>(≤ 20 deployments)"]
             DS["Datastore(s) → project data lake"]
@@ -121,6 +122,7 @@ flowchart LR
         WS --> ST
         WS --> KV
         WS --> AI
+        WS --> MI
         WS --> ACR
         WS --> CC
         CC --> BEP
@@ -130,7 +132,7 @@ flowchart LR
     classDef shared fill:#fff3e0,stroke:#e65100,color:#000
     classDef stamp fill:#f3e5f5,stroke:#6a1b9a,color:#000
     class ACR,DNSLINK,LAW shared
-    class WS,ST,KV,AI,CC,BEP,DS,PE stamp
+    class WS,ST,KV,AI,MI,CC,BEP,DS,PE stamp
 ```
 
 **Stamp contents (authoritative list):**
@@ -145,6 +147,8 @@ flowchart LR
 | Batch endpoint (+ deployments) | Model serving | Per product |
 | Datastore(s) | Link to project data lake (external) | Per product, read-only to shared data |
 | Private endpoints for WS/ST/KV/ACR | Network isolation | Per product |
+| User-assigned managed identity (`id-aml-{env}-p{nnn}`) | Credential-free access to ADLS, ACR, Key Vault, CMK | Per product |
+| **Network isolation mode** | `AllowOnlyApprovedOutbound` — workspace blocks unapproved egress; only PE-approved destinations reachable | Per product |
 | **Shared ACR** (one per subscription) | Environment images, model images | **Shared across 25 stamps in the sub** |
 | **Private DNS zone links** | Resolve AML PE FQDNs through ALZ zones | **Shared per sub** (ALZ-owned zones) |
 | **Log Analytics link** | Diagnostic routing to ALZ central LA | **Shared per sub** |
@@ -168,6 +172,39 @@ flowchart LR
 | Compute nodes | 4,200 | 350 | Sized per VM family core quota |
 
 Every limit has **≥ 4× headroom** before the next split is needed, which gives room for product growth and for exception-only endpoint limit raises to buffer peaks.
+
+### 3.4 Full limit-by-limit audit
+
+The table below covers **every** AML subscription-scoped limit and shows how the 25-products-per-sub packing affects it.
+
+| AML limit | Scope | Default | Max (with exception) | Per-sub usage at 25 products | % of default | Solved by sub split? | Residual action |
+|---|---|---|---|---|---|---|---|
+| Endpoints (online + batch) | Sub / region | **100** | Exception-only | 25 | 25% | **Yes** | None |
+| Deployments (online + batch) | Sub / region | **500** | Exception-only | 25 – 500 (if 20 per EP) | 5 – 100% | **Yes** | Keep avg ≤ 10 deployments/EP |
+| Deployments per endpoint | Endpoint | **20** | Exception-only | 1 – 20 (model versions) | 5 – 100% | N/A (per-EP) | Lifecycle-manage old versions |
+| Total compute targets | Sub / region | **500** | **2,500** | 25 clusters | 5% | **Yes** | Raise to 2,500 at vend time for prd |
+| Dedicated cores per VM family | Sub / region / family | **24 – 300** (varies) | Raise via ticket | 25 × 14 × cores/node | **Exceeds default** | **Partially** — split gives separate pools | **Quota raise required per sub** |
+| Low-priority cores per region | Sub / region | **100 – 3,000** | Raise via ticket | Only if using LP nodes | — | **Yes** (separate pool) | Use for non-SLA workloads |
+| Total subscription core limit | Sub / region | Varies | Raise via ticket | 350 × cores/node | Likely exceeds | **Partially** | **Quota raise required per sub** |
+| Workspaces per subscription | Sub | No hard limit | — | 25 | — | N/A | None |
+| Workspace assets (datasets, runs, models) | Workspace | 10M each | — | Per product | — | N/A | None |
+| Max run time | Run | 30 days | — | Batch dependent | — | N/A | None |
+
+#### VM core quota — the limit that needs explicit action
+
+Subscription splitting gives each sub its own VM core quota pool, but the **default quota is too low for 25 × 14-node clusters** regardless of SKU:
+
+| VM SKU | Cores/node | Cores needed (25 × 14) | Default quota (typical) | Required raise |
+|---|---|---|---|---|
+| `Standard_DS3_v2` | 4 | **1,400** | ~100 (Dv2) | Raise to **1,500+** |
+| `Standard_D16s_v5` | 16 | **5,600** | ~100 (Dv5) | Raise to **6,000+** |
+| `Standard_NC6s_v3` (GPU) | 6 | **2,100** | 0 (GPU) | Raise from **0 to 2,500+** |
+
+**Three mitigations are built into the architecture:**
+
+1. **Automated quota raise at vend time** (§6.4) — the stamping pipeline fires a `Microsoft.Quota` REST API request immediately after subscription creation, before any workspace is deployed.
+2. **`min_instances=0`** on every cluster (§6.5) — cores are only consumed when jobs are running. Peak demand is rarely all 25 clusters × 14 nodes simultaneously; the quota raise covers the theoretical max.
+3. **Quota Groups** (§6.4) — pool VM core quotas across the 4 product-group subs in the same environment, so a sub running at 60% utilization can share unused cores with a sub peaking at 100%.
 
 ---
 
@@ -194,7 +231,7 @@ Five principles, all scoped to AML (ALZ principles are inherited, not re-stated)
 1. **Subscription = AML scale unit.** AML limits are regional per subscription, so scale out by adding AML subscriptions, not by stacking workspaces.
 2. **One workspace per product per environment.** No shared prod workspace across products — aligns with [cloud-scale-analytics AML guidance](https://learn.microsoft.com/azure/cloud-adoption-framework/scenarios/cloud-scale-analytics/best-practices/azure-machine-learning#implementation-overview).
 3. **Extend the existing stamping pipeline, don't fork it.** The AML stamp is a new *module* plugged into the existing vending/stamping pipeline; subscription creation, policy assignment, spoke VNet, and RBAC bootstrap already work.
-4. **Private-endpoint-only workspaces.** Reuse the ALZ-owned central Private DNS zones (`privatelink.api.azureml.ms`, `privatelink.notebooks.azure.net`); each AML subscription's spoke links to them.
+4. **Private-endpoint-only workspaces with locked-down egress.** Reuse the ALZ-owned central Private DNS zones (`privatelink.api.azureml.ms`, `privatelink.notebooks.azure.net`); each AML subscription's spoke links to them. Workspace network isolation mode is set to `AllowOnlyApprovedOutbound` — only PE-approved destinations are reachable, no open internet egress.
 5. **Headroom-first packing.** Target 25 % utilization of the 100-endpoint cap (= 25 products per sub) so endpoint-count, deployment-count, and compute-target limits all have ≥ 4× growth headroom before another sub is vended.
 
 ---
@@ -224,51 +261,54 @@ Both modules are pure IaC (Bicep or Terraform using [AVM modules](https://azure.
 
 ### 6.3 Product onboarding flow (reuses existing pipeline)
 
+The data scientist submits **one intake request**. The pipeline automatically fans out across **all three environments** — environment is never a user input.
+
 1. **Intake** (existing form): `product_id`, data classification, expected VM SKU, peak node count, region.
-2. **Allocator decides target subscription** for each env (dev / tst / prd):
-   - If any existing `aml-{env}-pg*` has **< 20 workspaces** AND **< 75 endpoints** AND matching region/SKU → place there.
-   - Else **ask the existing stamping pipeline** to vend a new `aml-{env}-pg{nn+1}` subscription. Once vended, `aml-sub-shared` runs automatically.
-3. **`aml-product-stamp` deploys** the product stamp (one per env) into the chosen subscription.
-4. **Product team** registers models, datastores, and runs jobs via [AML CLI v2](https://learn.microsoft.com/azure/machine-learning/how-to-configure-cli). No platform tickets needed.
+   - **No `env` field.** All three environments (dev, tst, prd) are always provisioned together.
+2. **Allocator computes `pg_index = ceil(product_id / 25)`** and resolves the target subscription **per environment**:
+   - For each `env` in `[dev, tst, prd]`:
+     - Look up `sub-aml-{env}-pg{pg_index}` via subscription tags (see Appendix A.2).
+     - If the subscription does not exist → **ask the existing stamping pipeline** to vend it. Once vended, `aml-sub-shared` runs automatically.
+3. **`aml-product-stamp` deploys in parallel** across all three environments into the resolved subscriptions.
+4. **Product team** receives three workspaces (dev / tst / prd) and registers models, datastores, and runs jobs via [AML CLI v2](https://learn.microsoft.com/azure/machine-learning/how-to-configure-cli). No platform tickets needed.
 
 Product-group membership is derived from `product_id` and pinned on first onboarding; **workspaces never move between subscriptions** (see Risks).
 
 ### 6.3.1 Worked example — onboarding Product 101
 
-Product 101 is the **first product beyond the original 100**, which means a new product-group subscription must be vended.
+Product 101 is the **first product beyond the original 100**, which means new product-group subscriptions must be vended across all three environments.
 
 ```
 Data scientist submits intake form
-  → product_id=101, env=prd, region=weu, sku=Standard_DS3_v2
+  → product_id=101, region=weu, sku=Standard_DS3_v2
+  → (no env field — all three environments are always created)
 
 Allocator runs:
-  → pg_index = ceil(101 / 25) = 5  →  target is sub-aml-prd-pg05
-  → sub-aml-prd-pg05 does not exist yet
-  → triggers the existing stamping pipeline to vend sub-aml-prd-pg05
+  → pg_index = ceil(101 / 25) = 5
+  → for each env in [dev, tst, prd]:
+       target = sub-aml-{env}-pg05
+       sub does not exist yet → trigger stamping pipeline
 ```
 
-**Pipeline execution (new subscription + first product):**
+**Pipeline execution per environment (runs 3× in parallel):**
 
 | Step | Module | Action | Approx. time |
 |---|---|---|---|
-| 1 | Existing pipeline | `Microsoft.Subscription` API creates `sub-aml-prd-pg05` | ~5 min |
+| 1 | Existing pipeline | `Microsoft.Subscription` API creates `sub-aml-{env}-pg05` | ~5 min |
 | 2 | Existing pipeline | MG placement under Corp LZ + policy assignment | ~2 min |
 | 3 | Existing pipeline | Spoke VNet creation + hub VNet peering | ~5 min |
-| 4 | **`aml-sub-shared`** | Deploy shared ACR (Premium, PE-enabled) + private DNS zone links to ALZ central zones + diagnostic settings → ALZ Log Analytics | ~8 min |
-| 5 | **`aml-product-stamp`** | Deploy `rg-aml-prd-p101` containing: AML workspace, ADLS Gen2, Key Vault, App Insights, 14-node AmlCompute cluster (`min=0, max=14`), batch endpoint, private endpoints | ~15 min |
+| 4 | **`aml-sub-shared`** | Shared ACR (Premium, PE-enabled) + private DNS zone links + diagnostic settings → ALZ Log Analytics | ~8 min |
+| 5 | **`aml-product-stamp`** | `rg-aml-{env}-p101`: AML workspace (network isolation = `AllowOnlyApprovedOutbound`), ADLS Gen2, Key Vault, App Insights, user-assigned managed identity, 14-node cluster (`min=0, max=14`), batch endpoint, private endpoints, tags, CMK (prd only) | ~15 min |
 
-**Data scientist receives:**
+**Data scientist receives (all three environments):**
 
-| What | Value |
-|---|---|
-| Workspace | `mlw-prd-p101-weu` |
-| Batch endpoint | `bep-p101-scoring` |
-| Resource group | `rg-aml-prd-p101` |
-| RBAC | Contributor on `rg-aml-prd-p101` |
+| Environment | Workspace | Batch endpoint | Resource group | RBAC |
+|---|---|---|---|---|
+| dev | `mlw-dev-p101-weu` | `bep-p101-scoring` | `rg-aml-dev-p101` | Contributor on RG |
+| tst | `mlw-tst-p101-weu` | `bep-p101-scoring` | `rg-aml-tst-p101` | Contributor on RG |
+| prd | `mlw-prd-p101-weu` | `bep-p101-scoring` | `rg-aml-prd-p101` | Contributor on RG |
 
-**Subsequent products (102–125) skip steps 1–4.** The subscription already exists and `aml-sub-shared` has already run, so only step 5 (`aml-product-stamp`) executes — roughly 15 minutes per product.
-
-> **Note:** The flow runs **3× per product** — once for each environment (dev, tst, prd). The allocator uses the same formula, so `sub-aml-dev-pg05`, `sub-aml-tst-pg05`, and `sub-aml-prd-pg05` are all vended (if they don't already exist) when product 101 is onboarded.
+**Subsequent products (102–125) skip steps 1–4.** The subscriptions already exist and `aml-sub-shared` has already run, so only step 5 (`aml-product-stamp`) executes — roughly 15 minutes per product across all three environments in parallel.
 
 ### 6.4 Quota operating model
 
@@ -285,7 +325,6 @@ Because **all workloads are batch**, exploit these:
 - Prefer **batch endpoints** over managed online endpoints — no request-rate limit, scales to the cluster capacity. Each batch endpoint can host **multiple deployments** (up to 20) tied to the same 14-node cluster; ideal for model versioning without burning the endpoint count. ([Batch endpoints](https://learn.microsoft.com/azure/machine-learning/concept-endpoints-batch?view=azureml-api-2))
 - Use **low-priority nodes** where SLA permits — separate quota pool (100 – 3,000 cores/region default) that doesn't compete with dedicated cores. ([Compute quotas](https://learn.microsoft.com/azure/machine-learning/how-to-manage-quotas?view=azureml-api-2#azure-machine-learning-compute))
 - Set cluster **`min_instances=0`** with short idle timeout — 14 is the *max*, not a reservation.
-- Consolidate models where possible: one workspace can host multiple products sharing a lifecycle; revisit the 1:1 workspace-to-product mapping for small products once the topology is live.
 
 ---
 
@@ -309,15 +348,16 @@ The design is linear in subscription count. Growth = vend more product-group sub
 
 | Products | Product-groups per env | AML subs | Additional action |
 |---|---|---|---|
-| 100 (today) | 4 | 12 | None — baseline |
+| 100 (today) | 4 | 12 | None — baseline. Enable **Quota Groups** from day one to pool core quotas across same-env subs |
 | 200 | 8 | 24 | Vend `pg05…pg08` per env via existing pipeline |
-| 400 | 16 | 48 | Same. Start using **Quota Groups** to share core quotas across same-env subs |
+| 400 | 16 | 48 | Same pattern; Quota Groups already active |
 | 1,000 | 40 | 120 | Add a **second region** for overflow + capacity reservations for GPU |
 
 Early-warning thresholds (stamping pipeline emits alerts before each is hit):
 
 - Workspaces in a sub ≥ **20** (80 % of budget) → vend next sub
 - Batch endpoints in a sub ≥ **75** (75 % of the 100 cap) → vend next sub
+- Total deployments in a sub ≥ **375** (75 % of the 500 cap) → review per-EP deployment count or vend next sub
 - Compute targets in a sub ≥ **400** (80 % of default 500, before raise to 2,500)
 - Any VM-family core quota utilization ≥ **75 %**
 
@@ -358,6 +398,272 @@ Early-warning thresholds (stamping pipeline emits alerts before each is hit):
 | D6 | Prefer batch endpoints + multiple deployments per endpoint (≤ 20) | Batch-only workload; multiplies model-version capacity without burning endpoint count |
 | D7 | Do not attempt `az resource move` for existing workspaces | Re-provision into new stamp + re-register models + re-point datastores is the only safe migration path |
 | D8 | Growth rule: vend `pg{n+1}` when an existing pg crosses 20 workspaces or 75 endpoints | Additive scaling; no reshuffle of existing products |
+| D9 | User-assigned managed identity per workspace | Required for PE-based data access; enables credential-free datastore + ACR pulls |
+| D10 | Standard tag schema on every AML resource | Enables cost allocation, ownership tracking, and tag-based subscription lookup |
+| D11 | CMK encryption for prd workspaces (optional for dev/tst) | Satisfies data-at-rest encryption policy for production ML artefacts |
+| D12 | Workspace network isolation = `AllowOnlyApprovedOutbound` | Blocks unapproved egress; all data-plane traffic goes via private endpoints only |
+
+---
+
+## Appendix A — Terraform allocator reference implementation
+
+The allocator maps a `product_id` to target subscriptions across **all three environments** and drives the stamping pipeline. The entire allocation is **deterministic and stateless**: `ceil(product_id / products_per_sub)` always resolves to the same product-group index. Environment is **not a user input** — the allocator iterates `for_each` over `["dev", "tst", "prd"]`.
+
+### A.1 Variables and core formula
+
+```hcl
+variable "product_id" {
+  type        = number
+  description = "Unique numeric ID of the ML product (1-based)"
+}
+
+variable "region" {
+  type    = string
+  default = "westeurope"
+}
+
+variable "products_per_sub" {
+  type        = number
+  default     = 25
+  description = "Max products packed into one subscription (controls headroom)"
+}
+
+variable "vm_sku" {
+  type        = string
+  default     = "Standard_DS3_v2"
+  description = "VM SKU for the batch compute cluster"
+}
+
+variable "product_owner" {
+  type        = string
+  description = "Entra group or UPN of the product team (used for RBAC + tags)"
+}
+
+variable "cost_center" {
+  type        = string
+  description = "Finance cost center for chargeback"
+}
+
+variable "cmk_key_vault_id" {
+  type        = string
+  default     = null
+  description = "Key Vault resource ID holding the CMK (required for prd)"
+}
+
+variable "cmk_key_name" {
+  type        = string
+  default     = null
+  description = "Key name in the CMK Key Vault (required for prd)"
+}
+
+locals {
+  environments = toset(["dev", "tst", "prd"])
+
+  # Core formula — ceil() is a Terraform built-in
+  pg_index = ceil(var.product_id / var.products_per_sub)
+
+  # Per-environment derived names
+  per_env = { for env in local.environments : env => {
+    subscription_name = format("sub-aml-%s-pg%02d", env, local.pg_index)
+    resource_group    = format("rg-aml-%s-p%03d", env, var.product_id)
+    workspace_name    = format("mlw-%s-p%03d-%s", env, var.product_id, var.region)
+    endpoint_name     = format("bep-p%03d-scoring", var.product_id)
+    identity_name     = format("id-aml-%s-p%03d", env, var.product_id)
+  }}
+
+  # Standard tag set applied to every resource
+  common_tags = {
+    product_id  = tostring(var.product_id)
+    pg_index    = tostring(local.pg_index)
+    cost_center = var.cost_center
+    owner       = var.product_owner
+    managed_by  = "aml-stamping-pipeline"
+  }
+}
+
+# Verification:
+# product_id=1   → ceil(1/25)   = 1  → pg01
+# product_id=25  → ceil(25/25)  = 1  → pg01
+# product_id=26  → ceil(26/25)  = 2  → pg02
+# product_id=100 → ceil(100/25) = 4  → pg04
+# product_id=101 → ceil(101/25) = 5  → pg05
+```
+
+### A.2 Subscription lookup (tag-based, not display-name)
+
+Using `display_name_contains` is fragile — display names can be duplicated or renamed. Instead, look up subscriptions by the `aml_pg_index` and `aml_environment` tags that the stamping pipeline writes at vend time.
+
+```hcl
+# Look up existing AML subscriptions by tag
+data "azurerm_subscriptions" "aml" {
+  # Returns ALL subscriptions visible to the SP; filtered in locals below
+}
+
+locals {
+  # Build a map of env → subscription_id for existing subs matching our pg_index
+  existing_subs = {
+    for sub in data.azurerm_subscriptions.aml.subscriptions :
+    sub.tags["aml_environment"] => sub.subscription_id
+    if try(sub.tags["aml_pg_index"], "") == tostring(local.pg_index)
+       && try(sub.tags["aml_environment"], "") != ""
+  }
+}
+```
+
+> **Service principal permissions:** The SP running this Terraform must have **Reader** at the tenant root management group (or at the Corp MG) to enumerate subscriptions and their tags via `azurerm_subscriptions`. If your SP is scoped more narrowly, use the [Azure Resource Graph](https://learn.microsoft.com/azure/governance/resource-graph/overview) `resources` table (`microsoft.resources/subscriptions`) with a tag filter instead — this requires only `ResourceGraph.Read` and works across subscriptions the SP has any role on.
+
+### A.3 Conditional subscription vending + shared resources (`for_each` over environments)
+
+The allocator iterates over all three environments. For each environment where the subscription does not yet exist, it vends one and runs `aml-sub-shared`.
+
+```hcl
+# Vend subscriptions that don't exist yet
+module "vend_subscription" {
+  for_each = {
+    for env in local.environments : env => local.per_env[env]
+    if !contains(keys(local.existing_subs), env)
+  }
+  source = "../modules/subscription-vend"  # YOUR existing stamping module
+
+  subscription_name = each.value.subscription_name
+  environment       = each.key
+  region            = var.region
+  tags = merge(local.common_tags, {
+    aml_environment = each.key
+    aml_pg_index    = tostring(local.pg_index)
+  })
+}
+
+# Shared resources for newly vended subscriptions
+module "aml_sub_shared" {
+  for_each = module.vend_subscription
+  source   = "../modules/aml-sub-shared"
+
+  subscription_id = each.value.subscription_id
+  region          = var.region
+  tags            = local.common_tags
+}
+
+# Resolve subscription_id per env (existing or freshly vended)
+locals {
+  resolved_sub_ids = {
+    for env in local.environments : env => (
+      contains(keys(local.existing_subs), env)
+      ? local.existing_subs[env]
+      : module.vend_subscription[env].subscription_id
+    )
+  }
+}
+```
+
+### A.4 AML product stamp (`for_each` over environments)
+
+```hcl
+module "aml_product_stamp" {
+  for_each = local.per_env
+  source   = "../modules/aml-product-stamp"
+
+  subscription_id = local.resolved_sub_ids[each.key]
+  resource_group  = each.value.resource_group
+  workspace_name  = each.value.workspace_name
+  endpoint_name   = each.value.endpoint_name
+  environment     = each.key
+  region          = var.region
+  product_id      = var.product_id
+  vm_sku          = var.vm_sku
+  tags            = merge(local.common_tags, { environment = each.key })
+
+  # --- Managed identity (D9) ---
+  create_user_assigned_identity = true
+  identity_name                 = each.value.identity_name
+
+  # --- Network isolation (D12) ---
+  network_isolation_mode         = "AllowOnlyApprovedOutbound"
+  public_network_access_enabled  = false
+
+  # --- CMK encryption (D11) — prd only ---
+  enable_cmk       = each.key == "prd"
+  cmk_key_vault_id = each.key == "prd" ? var.cmk_key_vault_id : null
+  cmk_key_name     = each.key == "prd" ? var.cmk_key_name : null
+}
+```
+
+### A.5 Outputs
+
+```hcl
+output "stamps" {
+  description = "Per-environment stamp details"
+  value = {
+    for env, stamp in module.aml_product_stamp : env => {
+      subscription   = local.per_env[env].subscription_name
+      resource_group = local.per_env[env].resource_group
+      workspace      = local.per_env[env].workspace_name
+      endpoint       = local.per_env[env].endpoint_name
+      identity       = stamp.identity_principal_id
+    }
+  }
+}
+```
+
+### A.6 Idempotency and race-condition notes
+
+> **Idempotency:** Every module call is idempotent. Re-running the pipeline for the same `product_id` is safe — Terraform's state backend detects existing resources and produces a no-op plan. The `for_each` key is the environment name, which is stable.
+>
+> **Race condition:** If two products (e.g. 101 and 102) are onboarded simultaneously and both trigger vending of `sub-aml-{env}-pg05`, the stamping pipeline must serialise subscription creation. Two approaches:
+>
+> 1. **State locking (recommended):** Use a remote backend with state locking (e.g. Azure Storage + lease). The second run waits for the lock, sees the subscription in state, and skips vending.
+> 2. **Pipeline queue:** Gate subscription-vending steps behind a concurrency-1 queue (e.g. GitHub Actions concurrency group, ADO exclusive lock). Product-stamp steps can still run in parallel since they target different resource groups.
+>
+> **Subscription tag contract:** The stamping pipeline **must** write `aml_pg_index` and `aml_environment` tags on every AML subscription at vend time. These tags are the lookup key in A.2 and must never be removed or altered after creation.
+
+### A.7 Tagging strategy
+
+Every resource created by the AML stamp modules carries the following tags:
+
+| Tag | Source | Purpose |
+|---|---|---|
+| `product_id` | Intake form | Cost allocation, ownership lookup |
+| `pg_index` | Computed (`ceil`) | Subscription grouping identifier |
+| `cost_center` | Intake form | Finance chargeback |
+| `owner` | Intake form | Product team contact |
+| `environment` | Pipeline | Env identification (dev / tst / prd) |
+| `managed_by` | Hardcoded | Drift detection — identifies pipeline-managed resources |
+| `aml_pg_index` | Computed (sub-level) | Tag-based subscription lookup key |
+| `aml_environment` | Pipeline (sub-level) | Tag-based subscription lookup key |
+
+> Tags are enforced by Azure Policy inherited from the Corp MG. Resources missing required tags will be denied at deployment time.
+
+### A.8 Managed identity model
+
+Each AML workspace gets a **user-assigned managed identity** (`id-aml-{env}-p{nnn}`).
+
+| Access target | Role | Scope |
+|---|---|---|
+| Workspace default ADLS Gen2 | Storage Blob Data Contributor | Storage account |
+| Shared ACR | AcrPull | ACR (subscription-level) |
+| Product Key Vault | Key Vault Secrets User | Key Vault |
+| External project data lake | Storage Blob Data Reader | Container or storage account (granted by data-platform team) |
+| CMK Key Vault (prd only) | Key Vault Crypto User | Key (granted for CMK unwrap) |
+
+This identity is used for:
+- Credential-free **datastore** access (no SAS tokens or account keys stored in AML).
+- **ACR image pulls** during batch endpoint deployment.
+- **CMK unwrap** for workspace encryption (prd only, see A.9).
+
+### A.9 Customer-managed key (CMK) encryption
+
+| Environment | CMK enabled | Rationale |
+|---|---|---|
+| dev | No | Faster iteration; Microsoft-managed keys are sufficient |
+| tst | No | Mirrors dev for consistency; no production data |
+| prd | **Yes** | Satisfies data-at-rest encryption policy for production ML artefacts |
+
+When `enable_cmk = true`, the `aml-product-stamp` module:
+1. Grants the workspace's user-assigned managed identity the `Key Vault Crypto User` role on the CMK key.
+2. Configures the AML workspace with `encryption.key_vault_properties` pointing to the CMK key.
+3. Ensures the workspace default storage account also uses CMK. (AML internally provisions a Cosmos DB instance for metadata; when `v1_legacy_mode` is disabled, AML uses a workspace-managed Cosmos DB that inherits the workspace CMK setting automatically. No separate Cosmos DB CMK configuration is needed.)
+
+> **Implementation note:** The `modules/subscription-vend` source is a placeholder for your organisation's existing stamping module. The `modules/aml-sub-shared` and `modules/aml-product-stamp` modules are the two new AML-specific modules defined in §6.1.
 
 ---
 
