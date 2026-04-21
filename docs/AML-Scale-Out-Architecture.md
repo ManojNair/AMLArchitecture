@@ -39,6 +39,20 @@ Sources: [Manage quotas for Azure Machine Learning](https://learn.microsoft.com/
 
 **Decision:** Define an **AML stamp** and plug it into the **existing subscription-stamping pipeline**. Scale horizontally by vending **12 AML-dedicated application subscriptions** (`4 product-groups × 3 environments`) under the existing Corp landing-zone hierarchy. Each subscription hosts **25 products** — 25 % of the endpoint cap, leaving ≥ 4× growth headroom. No new landing-zone, MG, networking, or identity design is introduced.
 
+### 1.1 Architecture review outcome against the problem statement
+
+This architecture **does address** the stated problem (subscription-level AML quota limits in a single-subscription model) and follows Microsoft guidance that subscriptions are a valid scale boundary in CAF.
+
+| Problem statement ask | Architecture response | Outcome |
+|---|---|---|
+| 100 products × 3 workspaces in one subscription is hitting AML limits | Split by `environment × product-group` into 12 AML subscriptions (`4 groups × 3 env`) | ✅ Solves subscription-scoped endpoint and compute-target pressure |
+| Need a scalable way to grow beyond 100 products | Deterministic packing rule `pg_index = ceil(product_id / 25)` and additive vending (`pg05`, `pg06`, …) | ✅ Linear scale-out with no reshuffle |
+| All workloads are batch | Standardize on batch endpoints with up to 20 deployments per endpoint | ✅ Preserves endpoint headroom and supports model versioning |
+| Need best-practice guidance on splitting across subscriptions | Reuse existing ALZ + subscription-stamping pipeline; add only `aml-sub-shared` and `aml-product-stamp` modules | ✅ Aligns with CAF subscription design and deployment-stamp patterns |
+| Need Microsoft Learn references | Included in §8 (AML quotas, CAF subscription design/vending, deployment stamps, batch endpoints) | ✅ Complete |
+
+**Residual actions required before rollout:** pre-approve VM-family core quota raises per AML subscription, enable Quota Groups per environment, and automate quota alerts at 75% utilization.
+
 ---
 
 ## 2. Why we are hitting limits (the "what")
