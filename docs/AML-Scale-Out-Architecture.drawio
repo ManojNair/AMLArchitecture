@@ -1,0 +1,43 @@
+<mxfile host="app.diagrams.net" modified="2026-04-21T15:13:51.822Z" agent="copilot" version="26.0.11" type="device">
+  <diagram id="aml-scale-out" name="AML Scale-Out Reference">
+    <mxGraphModel dx="1280" dy="720" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="2" value="Existing ALZ&lt;br/&gt;Corp application-landing-zone MG" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eceff1;strokeColor=#455a64;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="520" y="40" width="360" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="DEV&lt;br/&gt;aml-dev-pg01..pg04" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f5e9;strokeColor=#2e7d32;" vertex="1" parent="1">
+          <mxGeometry x="180" y="180" width="250" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="4" value="TEST&lt;br/&gt;aml-tst-pg01..pg04" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff8e1;strokeColor=#f9a825;" vertex="1" parent="1">
+          <mxGeometry x="580" y="180" width="250" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="5" value="PROD&lt;br/&gt;aml-prd-pg01..pg04" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffebee;strokeColor=#c62828;" vertex="1" parent="1">
+          <mxGeometry x="980" y="180" width="250" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="6" value="Per product stamp (one per env):&lt;br/&gt;AML Workspace + ADLS + KV + AI + MI + 14-node AmlCompute + Batch Endpoint + Private Endpoints" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f3e5f5;strokeColor=#6a1b9a;" vertex="1" parent="1">
+          <mxGeometry x="300" y="360" width="820" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="7" style="endArrow=block;html=1;strokeWidth=2;" edge="1" parent="1" source="2" target="3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="8" style="endArrow=block;html=1;strokeWidth=2;" edge="1" parent="1" source="2" target="4">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="9" style="endArrow=block;html=1;strokeWidth=2;" edge="1" parent="1" source="2" target="5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="10" style="endArrow=block;html=1;strokeWidth=2;" edge="1" parent="1" source="3" target="6">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="11" style="endArrow=block;html=1;strokeWidth=2;" edge="1" parent="1" source="4" target="6">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="12" style="endArrow=block;html=1;strokeWidth=2;" edge="1" parent="1" source="5" target="6">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

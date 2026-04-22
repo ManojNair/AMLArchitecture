@@ -48,6 +48,7 @@ flowchart TB
 ## Contents
 
 - [`docs/AML-Scale-Out-Architecture.md`](docs/AML-Scale-Out-Architecture.md) — full architecture document, including:
+  - Architecture review outcome against the original problem statement
   - Scope and assumptions (ALZ + stamping pre-existing)
   - Why AML limits force subscription fan-out
   - **AML stamp** definition (authoritative resource list)
@@ -59,6 +60,7 @@ flowchart TB
   - Scaling beyond 100 products
   - Microsoft Learn references
   - Decision log
+- [`docs/AML-Scale-Out-Architecture.drawio`](docs/AML-Scale-Out-Architecture.drawio) — editable draw.io reference diagram source
 
 ## Key Microsoft Learn references
 
@@ -80,7 +82,8 @@ flowchart TB
 
 ## Viewing the diagrams
 
-All diagrams are authored in **Mermaid** and render natively on GitHub.
+- Main architecture diagrams in the document are authored in **Mermaid** and render natively on GitHub.
+- An editable **draw.io** source is provided at `docs/AML-Scale-Out-Architecture.drawio`.
 
 ## Contributing
 
