@@ -667,4 +667,124 @@ When `enable_cmk = true`, the `aml-product-stamp` module:
 
 ---
 
+## Appendix B — Detailed walkthrough: Products 1 through 101
+
+This appendix traces the full lifecycle from the very first product through the moment a new product-group subscription is vended, explaining **why** the ceiling formula creates clean boundaries.
+
+### B.1 Product 1 arrives (cold start)
+
+**Intake:** `product_id=1, region=weu, sku=Standard_DS3_v2`
+
+**Allocator:** `ceil(1 / 25) = 1` → target is `pg01` across all three environments.
+
+No AML subscriptions exist yet. The stamping pipeline vends **3 subscriptions in parallel:**
+
+| Subscription | Environment | Tags written |
+|---|---|---|
+| `sub-aml-dev-pg01` | dev | `aml_pg_index=1`, `aml_environment=dev` |
+| `sub-aml-tst-pg01` | tst | `aml_pg_index=1`, `aml_environment=tst` |
+| `sub-aml-prd-pg01` | prd | `aml_pg_index=1`, `aml_environment=prd` |
+
+**For each subscription, the full pipeline runs:**
+
+```
+Step 1  Subscription created (Microsoft.Subscription API)
+Step 2  Placed under Corp MG, policies assigned
+Step 3  Spoke VNet created, peered to hub
+Step 4  aml-sub-shared:
+          → Premium ACR (private endpoint)
+          → Private DNS zone links to ALZ zones
+          → Diagnostic settings → central Log Analytics
+Step 5  aml-product-stamp deploys Product 1:
+          → rg-aml-{env}-p001
+          → AML Workspace: mlw-{env}-p001-weu
+          → ADLS Gen2, Key Vault, App Insights
+          → User-assigned MI: id-aml-{env}-p001
+          → AmlCompute cluster: min=0, max=14
+          → Batch endpoint: bep-p001-scoring
+          → Private endpoints (WS, storage, KV, ACR)
+          → CMK (prd only)
+```
+
+**State after Product 1:**
+
+| Subscription | Workspaces | Endpoints | Clusters | Max nodes | % of endpoint cap |
+|---|---|---|---|---|---|
+| `sub-aml-dev-pg01` | 1 | 1 | 1 | 14 | 1% |
+| `sub-aml-tst-pg01` | 1 | 1 | 1 | 14 | 1% |
+| `sub-aml-prd-pg01` | 1 | 1 | 1 | 14 | 1% |
+
+### B.2 Products 2 through 25 (filling pg01)
+
+Each one runs the same allocator: `ceil(2/25) = 1`, `ceil(3/25) = 1`, …, `ceil(25/25) = 1`. **All map to pg01.**
+
+Steps 1–4 are skipped every time — the subscriptions already exist and `aml-sub-shared` already ran. Only **Step 5** (`aml-product-stamp`) executes, deploying into the same subscription.
+
+**State after Product 25 (pg01 at target density):**
+
+| Subscription | Workspaces | Endpoints | Clusters | Max nodes | % of endpoint cap |
+|---|---|---|---|---|---|
+| `sub-aml-dev-pg01` | 25 | 25 | 25 | 350 | **25%** |
+| `sub-aml-tst-pg01` | 25 | 25 | 25 | 350 | **25%** |
+| `sub-aml-prd-pg01` | 25 | 25 | 25 | 350 | **25%** |
+
+This is the **target packing density** — 25% of the 100-endpoint cap, with 75% headroom remaining.
+
+### B.3 Product 26 arrives — the boundary crossing
+
+**Allocator:** `ceil(26 / 25) = 2` → target is **pg02**.
+
+`sub-aml-{env}-pg02` does not exist. The pipeline vends **3 new subscriptions**, and the full pipeline (Steps 1–5) runs again.
+
+**State after Product 26:**
+
+| Subscription | Workspaces | Endpoints | % of cap |
+|---|---|---|---|
+| `sub-aml-prd-pg01` | 25 | 25 | 25% ← full (at target) |
+| `sub-aml-prd-pg02` | 1 | 1 | 1% ← fresh |
+
+Product 26 has its own subscription with its own endpoint cap, compute-target pool, and VM core quota — completely independent of pg01.
+
+### B.4 The full lifecycle: Products 1 → 100
+
+```
+Products  1–25  → ceil = 1 → pg01  (3 subs vended at Product 1)
+Products 26–50  → ceil = 2 → pg02  (3 subs vended at Product 26)
+Products 51–75  → ceil = 3 → pg03  (3 subs vended at Product 51)
+Products 76–100 → ceil = 4 → pg04  (3 subs vended at Product 76)
+```
+
+**Final state at 100 products:**
+
+| Product-group | Products | Subs created | WS per sub | EP per sub | % of EP cap |
+|---|---|---|---|---|---|
+| pg01 | 1–25 | 3 (dev/tst/prd) | 25 | 25 | 25% |
+| pg02 | 26–50 | 3 | 25 | 25 | 25% |
+| pg03 | 51–75 | 3 | 25 | 25 | 25% |
+| pg04 | 76–100 | 3 | 25 | 25 | 25% |
+| **Total** | **100** | **12** | | | |
+
+Every subscription was vended **only when the first product in that group was onboarded** — no pre-provisioning.
+
+### B.5 Product 101 — growth beyond the original 100
+
+`ceil(101/25) = 5` → pg05 → 3 new subs vended → and the cycle continues. No existing product moves. No existing subscription is affected.
+
+### B.6 Why `ceil()` and not alternatives
+
+| Property | `ceil(id/25)` | Round-robin (`id mod N`) | Lookup table (DB) |
+|---|---|---|---|
+| Stateless (no external store) | ✅ | ✅ | ❌ |
+| Stable (product never moves subs) | ✅ | ❌ reshuffles when N changes | ✅ if DB is correct |
+| Subscriptions created on-demand | ✅ pg02 vended only at product 26 | ❌ all N subs pre-created | ✅ |
+| Deterministic (same input = same output) | ✅ | ✅ | ❌ depends on DB state |
+| Growable without touching existing products | ✅ pg05 appears at product 101 | ❌ changing mod reshuffles | ✅ |
+| Auditable by anyone with a calculator | ✅ | ✅ | ❌ requires DB access |
+
+**Round-robin breaks at growth:** if you start with `mod 4` for 100 products and then need `mod 5` for 125 products, product 5 moves from sub 1 to sub 0, product 6 moves from sub 2 to sub 1, etc. AML workspaces cannot be moved between subscriptions, so this is fatal.
+
+**Lookup table adds a dependency:** the stamping pipeline must query a database before every onboarding. If the DB is down, onboarding is blocked. If a row is misedited, a workspace is deployed to the wrong subscription. The `ceil()` formula eliminates this entire failure class.
+
+---
+
 *End of document.*
